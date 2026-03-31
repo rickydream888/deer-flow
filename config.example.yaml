@@ -246,6 +246,46 @@ models:
   #   max_tokens: 8192
   #   temperature: 0.7
 
+  # Example: GitHub Copilot models
+  # GitHub Copilot exposes an OpenAI-compatible API for subscribers.
+  # Authentication uses a short-lived Copilot API token that is automatically
+  # obtained and refreshed from your GitHub token.
+  #
+  # GitHub token lookup order (first non-empty value wins):
+  #   1. COPILOT_GITHUB_TOKEN environment variable
+  #   2. GH_TOKEN environment variable
+  #   3. GITHUB_TOKEN environment variable
+  #   4. ~/.config/github-copilot/hosts.json  (GitHub CLI / VS Code credential store)
+  #
+  # To authenticate via the GitHub CLI, run: gh auth login --scopes copilot
+  # Then the token is read automatically from the credential store.
+  #
+  # - name: github-copilot-gpt-4o
+  #   display_name: GPT-4o (GitHub Copilot)
+  #   use: deerflow.models.github_copilot_provider:GitHubCopilotChatModel
+  #   model: gpt-4o
+  #   request_timeout: 600.0
+  #   max_retries: 2
+  #   max_tokens: 4096
+  #   supports_vision: true
+  #
+  # - name: github-copilot-claude-sonnet
+  #   display_name: Claude Sonnet (GitHub Copilot)
+  #   use: deerflow.models.github_copilot_provider:GitHubCopilotChatModel
+  #   model: claude-sonnet-4.5
+  #   request_timeout: 600.0
+  #   max_retries: 2
+  #   max_tokens: 8192
+  #   supports_vision: true
+  #
+  # - name: github-copilot-o3-mini
+  #   display_name: o3-mini (GitHub Copilot)
+  #   use: deerflow.models.github_copilot_provider:GitHubCopilotChatModel
+  #   model: o3-mini
+  #   request_timeout: 600.0
+  #   max_retries: 2
+  #   max_tokens: 8192
+
 # ============================================================================
 # Tool Groups Configuration
 # ============================================================================
