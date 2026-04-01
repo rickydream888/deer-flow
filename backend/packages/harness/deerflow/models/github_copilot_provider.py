@@ -11,6 +11,11 @@ GitHub token lookup order:
   - GITHUB_TOKEN env var
   - ~/.config/github-copilot/hosts.json (GitHub CLI or VS Code credential store)
 
+To obtain a GitHub token via the device code flow (interactive), call::
+
+    from deerflow.models.github_copilot_provider import github_copilot_login
+    github_copilot_login()
+
 Config example:
     - name: github-copilot-gpt-4o
       use: deerflow.models.github_copilot_provider:GitHubCopilotChatModel
@@ -44,6 +49,14 @@ COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 # Refresh the Copilot token this many seconds before it actually expires.
 _TOKEN_EXPIRY_BUFFER_SECS = 60
+
+# ---------------------------------------------------------------------------
+# Device code login constants (mirrors login.ts)
+# ---------------------------------------------------------------------------
+
+_GITHUB_CLIENT_ID = "Iv1.b507a08c87ecfe98"
+_DEVICE_CODE_URL = "https://github.com/login/device/code"
+_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +159,142 @@ def _load_github_token_from_hosts_json() -> str:
 def load_github_copilot_github_token() -> str:
     """Load a GitHub token suitable for Copilot, trying env vars then files."""
     return _load_github_token_from_env() or _load_github_token_from_hosts_json()
+
+
+# ---------------------------------------------------------------------------
+# Device code login (mirrors login.ts)
+# ---------------------------------------------------------------------------
+
+
+def _request_device_code(scope: str = "read:user") -> dict:
+    """Request a GitHub device code for the given OAuth scope.
+
+    Returns the parsed JSON response which includes ``device_code``,
+    ``user_code``, ``verification_uri``, ``expires_in``, and ``interval``.
+
+    Raises :class:`ValueError` if the request fails or required fields are
+    missing from the response.
+    """
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(
+            _DEVICE_CODE_URL,
+            data={"client_id": _GITHUB_CLIENT_ID, "scope": scope},
+            headers={"Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    required = ("device_code", "user_code", "verification_uri")
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        raise ValueError(f"GitHub device code response missing fields: {missing}")
+    return data
+
+
+def _poll_for_access_token(device_code: str, interval_secs: float, expires_at: float) -> str:
+    """Poll GitHub for an OAuth access token using the device code flow.
+
+    Mirrors the ``pollForAccessToken`` function in ``login.ts``.
+
+    :param device_code: The device code received from :func:`_request_device_code`.
+    :param interval_secs: Minimum seconds to wait between polls.
+    :param expires_at: Unix timestamp when the device code expires.
+    :returns: The obtained GitHub OAuth access token.
+    :raises ValueError: On ``expired_token``, ``access_denied``, or other
+        non-retriable errors, or when the code expires before authorization.
+    """
+    body = {
+        "client_id": _GITHUB_CLIENT_ID,
+        "device_code": device_code,
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    }
+    poll_interval = max(1.0, interval_secs)
+
+    with httpx.Client(timeout=30) as client:
+        while time.time() < expires_at:
+            resp = client.post(
+                _ACCESS_TOKEN_URL,
+                data=body,
+                headers={"Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "access_token" in data and data["access_token"]:
+                return str(data["access_token"])
+
+            error = data.get("error", "unknown")
+            if error == "authorization_pending":
+                time.sleep(poll_interval)
+                continue
+            if error == "slow_down":
+                time.sleep(poll_interval + 2.0)
+                continue
+            if error == "expired_token":
+                raise ValueError("GitHub device code expired; run login again")
+            if error == "access_denied":
+                raise ValueError("GitHub login cancelled by user")
+            raise ValueError(f"GitHub device flow error: {error}")
+
+    raise ValueError("GitHub device code expired; run login again")
+
+
+def _save_github_token_to_hosts_json(token: str) -> None:
+    """Persist *token* to the GitHub Copilot credential file.
+
+    Writes to ``~/.config/github-copilot/hosts.json`` in the format used by
+    the GitHub CLI and the VS Code Copilot extension::
+
+        {"github.com": {"oauth_token": "<token>"}}
+
+    The directory is created automatically if it does not exist.
+    """
+    home = os.getenv("HOME", str(Path.home()))
+    hosts_path = Path(home) / ".config" / "github-copilot" / "hosts.json"
+    hosts_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict = {}
+    if hosts_path.exists():
+        try:
+            existing = json.loads(hosts_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+
+    existing.setdefault("github.com", {})["oauth_token"] = token
+    hosts_path.write_text(json.dumps(existing, indent=2))
+    logger.info("GitHub token saved to %s", hosts_path)
+
+
+def github_copilot_login(scope: str = "read:user") -> str:
+    """Interactive GitHub Copilot device-code login.
+
+    Implements the full device code flow described in ``login.ts``:
+
+    1. Requests a device code from GitHub.
+    2. Prints the verification URL and user code to stdout for the user to act on.
+    3. Polls GitHub until the user authorizes the app.
+    4. Saves the resulting OAuth token to ``~/.config/github-copilot/hosts.json``.
+
+    :param scope: GitHub OAuth scope(s) to request (default: ``"read:user"``).
+    :returns: The obtained GitHub OAuth access token.
+    :raises ValueError: If the device code flow fails or the user denies access.
+    """
+    logger.info("Requesting GitHub device code …")
+    device = _request_device_code(scope)
+
+    print("\nGitHub Copilot login")
+    print(f"  Visit:  {device['verification_uri']}")
+    print(f"  Code:   {device['user_code']}")
+    print("Waiting for GitHub authorization …\n")
+
+    expires_at = time.time() + device["expires_in"]
+    interval_secs = max(1.0, float(device.get("interval", 5)))
+
+    access_token = _poll_for_access_token(device["device_code"], interval_secs, expires_at)
+    logger.info("GitHub access token acquired via device code flow")
+
+    _save_github_token_to_hosts_json(access_token)
+    return access_token
 
 
 # ---------------------------------------------------------------------------

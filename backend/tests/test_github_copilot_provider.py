@@ -19,6 +19,10 @@ from deerflow.models.github_copilot_provider import (
     _load_github_token_from_env,
     _load_github_token_from_hosts_json,
     _parse_copilot_expires_at,
+    _poll_for_access_token,
+    _request_device_code,
+    _save_github_token_to_hosts_json,
+    github_copilot_login,
     load_github_copilot_github_token,
 )
 
@@ -389,3 +393,247 @@ def test_model_custom_editor_version(monkeypatch):
         editor_version="neovim/0.10.0",
     )
     assert model.default_headers.get("Editor-Version") == "neovim/0.10.0"
+
+
+# ---------------------------------------------------------------------------
+# _request_device_code
+# ---------------------------------------------------------------------------
+
+
+def test_request_device_code_success():
+    response_data = {
+        "device_code": "dev123",
+        "user_code": "ABCD-1234",
+        "verification_uri": "https://github.com/login/device",
+        "expires_in": 900,
+        "interval": 5,
+    }
+    mock_resp = mock.MagicMock(spec=httpx.Response)
+    mock_resp.json.return_value = response_data
+    mock_resp.raise_for_status = mock.MagicMock()
+
+    with mock.patch("httpx.Client") as mock_client_cls:
+        ctx = mock_client_cls.return_value.__enter__.return_value
+        ctx.post.return_value = mock_resp
+        result = _request_device_code("read:user")
+
+    assert result["device_code"] == "dev123"
+    assert result["user_code"] == "ABCD-1234"
+    assert result["verification_uri"] == "https://github.com/login/device"
+
+
+def test_request_device_code_missing_fields_raises():
+    response_data = {"device_code": "dev123"}  # missing user_code, verification_uri
+    mock_resp = mock.MagicMock(spec=httpx.Response)
+    mock_resp.json.return_value = response_data
+    mock_resp.raise_for_status = mock.MagicMock()
+
+    with mock.patch("httpx.Client") as mock_client_cls:
+        ctx = mock_client_cls.return_value.__enter__.return_value
+        ctx.post.return_value = mock_resp
+        with pytest.raises(ValueError, match="missing fields"):
+            _request_device_code("read:user")
+
+
+# ---------------------------------------------------------------------------
+# _poll_for_access_token
+# ---------------------------------------------------------------------------
+
+
+def test_poll_for_access_token_success():
+    mock_resp = mock.MagicMock(spec=httpx.Response)
+    mock_resp.json.return_value = {"access_token": "gho_new_token", "token_type": "bearer"}
+    mock_resp.raise_for_status = mock.MagicMock()
+
+    with mock.patch("httpx.Client") as mock_client_cls:
+        ctx = mock_client_cls.return_value.__enter__.return_value
+        ctx.post.return_value = mock_resp
+        token = _poll_for_access_token("dev123", 1.0, time.time() + 900)
+
+    assert token == "gho_new_token"
+
+
+def test_poll_for_access_token_authorization_pending_then_success():
+    """Should retry on authorization_pending and succeed on the next poll."""
+    pending_resp = mock.MagicMock(spec=httpx.Response)
+    pending_resp.json.return_value = {"error": "authorization_pending"}
+    pending_resp.raise_for_status = mock.MagicMock()
+
+    success_resp = mock.MagicMock(spec=httpx.Response)
+    success_resp.json.return_value = {"access_token": "gho_ok"}
+    success_resp.raise_for_status = mock.MagicMock()
+
+    with mock.patch("httpx.Client") as mock_client_cls:
+        ctx = mock_client_cls.return_value.__enter__.return_value
+        ctx.post.side_effect = [pending_resp, success_resp]
+        with mock.patch("time.sleep"):
+            token = _poll_for_access_token("dev123", 1.0, time.time() + 900)
+
+    assert token == "gho_ok"
+
+
+def test_poll_for_access_token_slow_down_then_success():
+    slow_resp = mock.MagicMock(spec=httpx.Response)
+    slow_resp.json.return_value = {"error": "slow_down"}
+    slow_resp.raise_for_status = mock.MagicMock()
+
+    success_resp = mock.MagicMock(spec=httpx.Response)
+    success_resp.json.return_value = {"access_token": "gho_ok"}
+    success_resp.raise_for_status = mock.MagicMock()
+
+    with mock.patch("httpx.Client") as mock_client_cls:
+        ctx = mock_client_cls.return_value.__enter__.return_value
+        ctx.post.side_effect = [slow_resp, success_resp]
+        with mock.patch("time.sleep"):
+            token = _poll_for_access_token("dev123", 1.0, time.time() + 900)
+
+    assert token == "gho_ok"
+
+
+def test_poll_for_access_token_expired_token_raises():
+    mock_resp = mock.MagicMock(spec=httpx.Response)
+    mock_resp.json.return_value = {"error": "expired_token"}
+    mock_resp.raise_for_status = mock.MagicMock()
+
+    with mock.patch("httpx.Client") as mock_client_cls:
+        ctx = mock_client_cls.return_value.__enter__.return_value
+        ctx.post.return_value = mock_resp
+        with pytest.raises(ValueError, match="expired"):
+            _poll_for_access_token("dev123", 1.0, time.time() + 900)
+
+
+def test_poll_for_access_token_access_denied_raises():
+    mock_resp = mock.MagicMock(spec=httpx.Response)
+    mock_resp.json.return_value = {"error": "access_denied"}
+    mock_resp.raise_for_status = mock.MagicMock()
+
+    with mock.patch("httpx.Client") as mock_client_cls:
+        ctx = mock_client_cls.return_value.__enter__.return_value
+        ctx.post.return_value = mock_resp
+        with pytest.raises(ValueError, match="cancelled"):
+            _poll_for_access_token("dev123", 1.0, time.time() + 900)
+
+
+def test_poll_for_access_token_unknown_error_raises():
+    mock_resp = mock.MagicMock(spec=httpx.Response)
+    mock_resp.json.return_value = {"error": "some_weird_error"}
+    mock_resp.raise_for_status = mock.MagicMock()
+
+    with mock.patch("httpx.Client") as mock_client_cls:
+        ctx = mock_client_cls.return_value.__enter__.return_value
+        ctx.post.return_value = mock_resp
+        with pytest.raises(ValueError, match="some_weird_error"):
+            _poll_for_access_token("dev123", 1.0, time.time() + 900)
+
+
+def test_poll_for_access_token_already_expired_raises():
+    """Raises immediately when expires_at is already in the past."""
+    with mock.patch("httpx.Client"):
+        with pytest.raises(ValueError, match="expired"):
+            _poll_for_access_token("dev123", 1.0, time.time() - 1)
+
+
+# ---------------------------------------------------------------------------
+# _save_github_token_to_hosts_json
+# ---------------------------------------------------------------------------
+
+
+def test_save_github_token_creates_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _save_github_token_to_hosts_json("gho_saved")
+    hosts_path = tmp_path / ".config" / "github-copilot" / "hosts.json"
+    assert hosts_path.exists()
+    data = json.loads(hosts_path.read_text())
+    assert data["github.com"]["oauth_token"] == "gho_saved"
+
+
+def test_save_github_token_overwrites_existing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hosts_dir = tmp_path / ".config" / "github-copilot"
+    hosts_dir.mkdir(parents=True)
+    (hosts_dir / "hosts.json").write_text(json.dumps({"github.com": {"oauth_token": "gho_old"}}))
+
+    _save_github_token_to_hosts_json("gho_new")
+    data = json.loads((hosts_dir / "hosts.json").read_text())
+    assert data["github.com"]["oauth_token"] == "gho_new"
+
+
+def test_save_github_token_preserves_other_hosts(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hosts_dir = tmp_path / ".config" / "github-copilot"
+    hosts_dir.mkdir(parents=True)
+    (hosts_dir / "hosts.json").write_text(json.dumps({"other.example.com": {"oauth_token": "tok"}}))
+
+    _save_github_token_to_hosts_json("gho_new")
+    data = json.loads((hosts_dir / "hosts.json").read_text())
+    assert data["other.example.com"]["oauth_token"] == "tok"
+    assert data["github.com"]["oauth_token"] == "gho_new"
+
+
+def test_save_github_token_handles_corrupted_existing_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hosts_dir = tmp_path / ".config" / "github-copilot"
+    hosts_dir.mkdir(parents=True)
+    (hosts_dir / "hosts.json").write_text("not valid json {{")
+
+    # Should not raise; corrupted file is treated as empty.
+    _save_github_token_to_hosts_json("gho_recovered")
+    data = json.loads((hosts_dir / "hosts.json").read_text())
+    assert data["github.com"]["oauth_token"] == "gho_recovered"
+
+
+# ---------------------------------------------------------------------------
+# github_copilot_login (integration of device code flow)
+# ---------------------------------------------------------------------------
+
+
+def test_github_copilot_login_success(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    device_response = {
+        "device_code": "dev123",
+        "user_code": "ABCD-1234",
+        "verification_uri": "https://github.com/login/device",
+        "expires_in": 900,
+        "interval": 5,
+    }
+
+    monkeypatch.setattr(
+        "deerflow.models.github_copilot_provider._request_device_code",
+        lambda *_a, **_kw: device_response,
+    )
+    monkeypatch.setattr(
+        "deerflow.models.github_copilot_provider._poll_for_access_token",
+        lambda *_a, **_kw: "gho_login_token",
+    )
+
+    result = github_copilot_login()
+
+    assert result == "gho_login_token"
+    hosts_path = tmp_path / ".config" / "github-copilot" / "hosts.json"
+    data = json.loads(hosts_path.read_text())
+    assert data["github.com"]["oauth_token"] == "gho_login_token"
+
+
+def test_github_copilot_login_propagates_poll_error(monkeypatch):
+    monkeypatch.setattr(
+        "deerflow.models.github_copilot_provider._request_device_code",
+        lambda *_a, **_kw: {
+            "device_code": "dev123",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 5,
+        },
+    )
+
+    def _raise_cancelled(*_a, **_kw):
+        raise ValueError("GitHub login cancelled by user")
+
+    monkeypatch.setattr(
+        "deerflow.models.github_copilot_provider._poll_for_access_token",
+        _raise_cancelled,
+    )
+
+    with pytest.raises(ValueError, match="cancelled"):
+        github_copilot_login()
